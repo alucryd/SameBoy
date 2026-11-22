@@ -341,6 +341,21 @@ endif
 
 include Makefile.common
 
+# ORE support: make ORE=1 SMELT_DIR=/path/to/oxyromon/crates/smelt-rs, the
+# same tree Mesen's option wants, built with:
+#   (cd crates/smelt-rs && cargo build --release)
+# It is a Rust staticlib: build it for the host you link, and on linux only.
+ifeq ($(ORE),1)
+  ifeq ($(filter linux unix,$(platform)),)
+    $(error ORE=1 is wired for the linux target only; the other platforms need libsmelt's native-static-libs for their own libc)
+  else
+    SMELT_DIR ?= ../../oxyromon/crates/smelt-rs
+    CFLAGS += -DHAVE_ORE -I$(SMELT_DIR)/include
+    # libstd's own dependencies, from rustc --print native-static-libs
+    LDFLAGS += $(SMELT_DIR)/target/release/libsmelt.a -lpthread -ldl -lm -lrt -lutil
+  endif
+endif
+
 CFLAGS += -DGB_VERSION=\"$(VERSION)\"
 
 OBJECTS := $(patsubst $(CORE_DIR)/%.c,$(CORE_DIR)/build/obj/%_libretro.c.o,$(SOURCES_C))

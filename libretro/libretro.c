@@ -25,6 +25,10 @@
 #include <file/file_path.h>
 #include <streams/file_stream.h>
 #include "libretro_core_options.h"
+#ifdef HAVE_ORE
+#include <strings.h>
+#include <smelt.h>
+#endif
 
 #define MAX_VIDEO_WIDTH 256
 #define MAX_VIDEO_HEIGHT 224
@@ -403,9 +407,15 @@ static const struct retro_subsystem_memory_info gb2_memory[] = {
     { "rtc", RETRO_MEMORY_GAMEBOY_2_RTC },
 };
 
+#ifdef HAVE_ORE
+#define GB_EXTENSIONS "gb|gbc|ore"
+#else
+#define GB_EXTENSIONS "gb|gbc"
+#endif
+
 static const struct retro_subsystem_rom_info gb_roms[] = {
-    { "GameBoy #1", "gb|gbc", false, false, true, gb1_memory, 1 },
-    { "GameBoy #2", "gb|gbc", false, false, true, gb2_memory, 1 },
+    { "GameBoy #1", GB_EXTENSIONS, false, false, true, gb1_memory, 1 },
+    { "GameBoy #2", GB_EXTENSIONS, false, false, true, gb2_memory, 1 },
 };
 
 static const struct retro_subsystem_info subsystems[] = {
@@ -1296,7 +1306,7 @@ void retro_get_system_info(struct retro_system_info *info)
     info->library_version  = GB_VERSION;
 #endif
     info->need_fullpath    = false;
-    info->valid_extensions = "gb|gbc";
+    info->valid_extensions = GB_EXTENSIONS;
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info)
@@ -1496,15 +1506,81 @@ static enum rom_type check_rom_header(const uint8_t *data, size_t size)
     return type;
 }
 
+#ifdef HAVE_ORE
+/* Read an ORE, oxyromon's ROM format, through libsmelt as the ROM it holds:
+   a malloc'd buffer the caller frees, or NULL with the reason logged. */
+static uint8_t *load_ore_rom(const char *path, size_t *size)
+{
+    struct smelt_ingot *ingot = NULL;
+    uint64_t logical = 0;
+    uint8_t *rom = NULL;
+    char platform[32];
+    size_t platform_len = sizeof(platform);
+
+    if (smelt_open(path, NULL, &ingot) != SMELT_OK ||
+        smelt_logical_size(ingot, &logical) != SMELT_OK ||
+        smelt_platform(ingot, platform, &platform_len) != SMELT_OK) {
+        log_cb(RETRO_LOG_ERROR, "ORE %s: %s\n", path, smelt_last_error());
+        smelt_close(ingot);
+        return NULL;
+    }
+
+    /* The header check passes nearly anything, so the platform decides */
+    if (strcmp(platform, "gb") != 0 && strcmp(platform, "gbc") != 0) {
+        log_cb(RETRO_LOG_ERROR, "ORE %s is a %s ROM, which SameBoy does not run\n", path, platform);
+        smelt_close(ingot);
+        return NULL;
+    }
+
+    /* The largest Game Boy carts are 8 MiB */
+    if (logical == 0 || logical > (8u << 20)) {
+        log_cb(RETRO_LOG_ERROR, "ORE %s holds %llu bytes, too many for a Game Boy ROM\n",
+               path, (unsigned long long)logical);
+        smelt_close(ingot);
+        return NULL;
+    }
+
+    rom = (uint8_t *)malloc((size_t)logical);
+    if (!rom || smelt_read(ingot, 0, rom, (size_t)logical) != SMELT_OK) {
+        log_cb(RETRO_LOG_ERROR, "ORE %s: %s\n", path, rom ? smelt_last_error() : "out of memory");
+        free(rom);
+        rom = NULL;
+    }
+    smelt_close(ingot);
+    *size = (size_t)logical;
+    return rom;
+}
+
+static bool is_ore(const char *path)
+{
+    size_t len = path ? strlen(path) : 0;
+    return len >= 4 && strcasecmp(path + len - 4, ".ore") == 0;
+}
+#endif
+
 bool retro_load_game(const struct retro_game_info *info)
 {
     enum rom_type content_type  = ROM_TYPE_INVALID;
     const uint8_t *content_data = NULL;
     size_t content_size;
+#ifdef HAVE_ORE
+    uint8_t *ore_rom = NULL;
+#endif
 
     if (info) {
         content_data = (const uint8_t *)info->data;
         content_size = info->size;
+#ifdef HAVE_ORE
+        /* need_fullpath is off, so info->data holds the .ore's own bytes; the
+           frontend still passes the path, which is what libsmelt reads */
+        if (is_ore(info->path)) {
+            ore_rom = load_ore_rom(info->path, &content_size);
+            if (!ore_rom) {
+                return false;
+            }
+            content_data = ore_rom;
+        }
+#endif
         content_type = check_rom_header(content_data, content_size);
     }
 
@@ -1526,6 +1602,9 @@ bool retro_load_game(const struct retro_game_info *info)
         case ROM_TYPE_INVALID:
         default:
             log_cb(RETRO_LOG_ERROR, "Invalid content\n");
+#ifdef HAVE_ORE
+            free(ore_rom);
+#endif
             return false;
     }
 
@@ -1535,6 +1614,9 @@ bool retro_load_game(const struct retro_game_info *info)
     enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
     if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt)) {
         log_cb(RETRO_LOG_ERROR, "XRGB8888 is not supported\n");
+#ifdef HAVE_ORE
+        free(ore_rom);
+#endif
         return false;
     }
 
@@ -1542,6 +1624,10 @@ bool retro_load_game(const struct retro_game_info *info)
         init_for_current_model(i);
         GB_load_rom_from_buffer(&gameboy[i], content_data, content_size);
     }
+#ifdef HAVE_ORE
+    /* GB_load_rom_from_buffer keeps a copy of its own */
+    free(ore_rom);
+#endif
 
     bool achievements = true;
     environ_cb(RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS, &achievements);
@@ -1601,6 +1687,16 @@ bool retro_load_game_special(unsigned type, const struct retro_game_info *info, 
         enum rom_type content_type  = ROM_TYPE_INVALID;
         const uint8_t *content_data = info[i].data;
         size_t content_size         = info[i].size;
+#ifdef HAVE_ORE
+        uint8_t *ore_rom = NULL;
+        if (is_ore(info[i].path)) {
+            ore_rom = load_ore_rom(info[i].path, &content_size);
+            if (!ore_rom) {
+                return false;
+            }
+            content_data = ore_rom;
+        }
+#endif
 
         content_type = check_rom_header(content_data, content_size);
 
@@ -1617,11 +1713,17 @@ bool retro_load_game_special(unsigned type, const struct retro_game_info *info, 
             case ROM_TYPE_INVALID:
             default:
                 log_cb(RETRO_LOG_ERROR, "Invalid content\n");
+#ifdef HAVE_ORE
+                free(ore_rom);
+#endif
                 return false;
         }
 
         init_for_current_model(i);
         GB_load_rom_from_buffer(&gameboy[i], content_data, content_size);
+#ifdef HAVE_ORE
+        free(ore_rom);
+#endif
     }
 
     bool achievements = true;
